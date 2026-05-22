@@ -1,0 +1,8 @@
+{
+  "per_task_cap_usd": 2.00,
+  "per_phase_cap_usd": 20.00,
+  "tier_overrides": {},
+  "auto_downgrade_on_cap": true,
+  "cache_ttl_seconds": 3600,
+  "enforcement_mode": "enforce"
+}
