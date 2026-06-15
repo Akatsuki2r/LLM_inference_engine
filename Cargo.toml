@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/*",
+]
+
+[workspace.dependencies]
+# Core dependencies shared across the workspace
+anyhow = "1.0"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.11"
+cfg-if = "1.0"
