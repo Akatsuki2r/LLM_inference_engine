@@ -1,0 +1,9 @@
+[package]
+name = "aether-tensor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aether-arena = { path = "../arena" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
