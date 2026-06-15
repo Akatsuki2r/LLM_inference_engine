@@ -1,0 +1,12 @@
+[package]
+name = "aether-transformer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aether-tensor = { path = "../tensor" }
+aether-arena = { path = "../arena" }
+aether-kernels = { path = "../kernels" }
+aether-formats = { path = "../formats" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

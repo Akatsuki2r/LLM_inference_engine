@@ -1,0 +1,9 @@
+[package]
+name = "aether-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aether-transformer = { path = "../transformer" }
+aether-tensor = { path = "../tensor" }
+aether-arena = { path = "../arena" }
