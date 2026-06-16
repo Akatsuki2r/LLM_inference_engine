@@ -1,8 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
     use aether_arena::{UnifiedArena, MemoryCategory};
-    use aether_tensor::{TensorView, TensorMut};
+    use aether_tensor::{TensorView, TensorMut, TensorType};
     use aether_kernels::{NaiveEngine, simd::AvxEngine};
     use std::vec;
 
@@ -26,11 +25,11 @@ mod tests {
         let b_floats = unsafe { core::slice::from_raw_parts_mut(buf_b.as_mut_ptr() as *mut f32, 64) };
         for i in 0..64 { b_floats[i] = (i * 2) as f32; }
 
-        let view_a = TensorView::from_raw_parts(buf_a, vec![1, 8]).unwrap();
-        let view_b = TensorView::from_raw_parts(buf_b, vec![8, 8]).unwrap();
+        let view_a = TensorView::from_raw_parts(buf_a, &[1, 8], TensorType::F32).unwrap();
+        let view_b = TensorView::from_raw_parts(buf_b, &[8, 8], TensorType::F32).unwrap();
 
-        let mut mut_c_naive = TensorMut::from_raw_parts(buf_c_naive, vec![1, 8]).unwrap();
-        let mut mut_c_simd = TensorMut::from_raw_parts(buf_c_simd, vec![1, 8]).unwrap();
+        let mut mut_c_naive = TensorMut::from_raw_parts(buf_c_naive, &[1, 8], TensorType::F32).unwrap();
+        let mut mut_c_simd = TensorMut::from_raw_parts(buf_c_simd, &[1, 8], TensorType::F32).unwrap();
 
         // 1. Calculate naive reference baseline
         NaiveEngine::gemm(&view_a, &view_b, &mut mut_c_naive).unwrap();

@@ -1,65 +1,214 @@
-use aether_tensor::{TensorView, TensorMut, TensorError};
+use aether_tensor::{TensorView, TensorMut, TensorType};
 use crate::KernelError;
 
-/// Quantized GEMV engine for Q4_0 format.
-/// Performs fused dequantization and matrix-vector multiplication.
+/// Quantized GEMM engine for Q4_0 format.
+/// Performs fused dequantization and matrix multiplication.
 /// Assumes weight matrix is stored in Q4_0 format with block-wise scaling.
 pub struct Q4Engine;
 impl Q4Engine {
-    /// Fused Q4_0 dequantization and GEMV: y = A * x, where A is Q4_0 packed.
+    /// Fused Q4_0 dequantization and GEMM: C = A * B, where A is Q4_0 packed and B is f32.
     ///
     /// # Arguments
-    /// * `a_packed` - Packed Q4_0 weight matrix (M x K) as [u8; (K * 4 + 7) / 8 * M?]
-    ///   Actually, we expect the weight matrix to be stored in row-major order with blocks.
-    ///   Each row is divided into blocks of BLOCK_SIZE elements (typically 32).
-    ///   For each block, we have BLOCK_SIZE/2 bytes of packed weights (4 bits each) followed by a scale (f32).
-    ///   So the layout per row: [block0_weights (BLOCK_SIZE/2 bytes), scale0, block1_weights, scale1, ...]
-    /// * `scales` - Pointer to the scales for each block (f32). Length: (K + BLOCK_SIZE - 1) / BLOCK_SIZE per row.
-    ///   But note: we assume the scales are stored contiguously per row? Actually, in GGUF, the scales are stored
-    ///   in a separate array per tensor. We'll assume the caller has arranged the scales appropriately.
-    ///   For simplicity, we'll assume the scales are provided as a slice of f32 with length equal to
-    ///   number of blocks in the weight matrix (M * num_blocks_per_row).
-    /// * `x` - Input vector (f32) of length K.
-    /// * `y` - Output vector (f32) of length M (to be accumulated into).
+    /// * `a` - Packed Q4_0 weight matrix (M x K)
+    /// * `b` - f32 matrix (K x N)
+    /// * `c` - f32 output matrix (M x N) to accumulate into
+    /// * `a_scales` - Scale factors for A tensor, one per block
+    /// * `block_size` - Block size for quantization (typically 32 for Q4_0)
     ///
     /// # Safety
     /// This function uses unsafe pointer arithmetic and assumes that the input pointers are valid
     /// and the tensors are properly aligned and within bounds.
     #[inline(always)]
-    pub unsafe fn gemv_q4_0(
-        a_packed: *const u8,
-        scales: *const f32,
-        x: *const f32,
-        y: *mut f32,
-        m: usize, // number of rows
-        k: usize, // number of columns
+    pub unsafe fn gemm_q4_0_f32_f32(
+        a: &TensorView,
+        b: &TensorView,
+        c: &mut TensorMut,
+        a_scales: &[f32],
         block_size: usize, // typically 32 for Q4_0
-    ) {
-        let num_blocks_per_row = (k + block_size - 1) / block_size;
+    ) -> Result<(), KernelError> {
+        // Validate tensor types
+        if a.tensor_type() != TensorType::Q4_0 {
+            return Err(KernelError::QuantizationNotSupported);
+        }
+        if b.tensor_type() != TensorType::F32 {
+            return Err(KernelError::QuantizationNotSupported);
+        }
+        if c.tensor_type() != TensorType::F32 {
+            return Err(KernelError::QuantizationNotSupported);
+        }
 
+        let shape_a = a.shape();
+        let shape_b = b.shape();
+        let shape_c = c.shape();
+
+        // Validate dimensions
+        if shape_a.len() != 2 || shape_b.len() != 2 || shape_c.len() != 2 {
+            return Err(KernelError::DimensionMismatch);
+        }
+
+        let m = shape_a[0]; // rows of A
+        let k = shape_a[1]; // cols of A, rows of B
+        let n = shape_b[1]; // cols of B
+
+        if k != shape_b[0] {
+            return Err(KernelError::DimensionMismatch);
+        }
+        if m != shape_c[0] || n != shape_c[1] {
+            return Err(KernelError::DimensionMismatch);
+        }
+
+        let num_blocks_per_row = (k + block_size - 1) / block_size;
+        let expected_scales_len = m * num_blocks_per_row;
+        if a_scales.len() != expected_scales_len {
+            return Err(KernelError::DimensionMismatch);
+        }
+
+        // Process each row of A
+        for i in 0..m {
+            // Process each column of B (each output column)
+            for j in 0..n {
+                let mut acc = 0.0f32;
+
+                // Process each block in the row
+                for block_idx in 0..num_blocks_per_row {
+                    let block_start = block_idx * block_size;
+                    let block_end = core::cmp::min(block_start + block_size, k);
+                    let actual_block_len = block_end - block_start;
+
+                    // Pointer to the packed weights for this block in the row
+                    let weights_ptr = a.data().as_ptr().add(
+                        i * (num_blocks_per_row * (block_size / 2)) +
+                        block_idx * (block_size / 2)
+                    );
+                    // Pointer to the scale for this block
+                    let scale_ptr = a_scales.as_ptr().add(i * num_blocks_per_row + block_idx);
+                    let scale = *scale_ptr;
+
+                    // Process the block in chunks of 2 elements (since each byte holds 2 weights)
+                    let mut k_in_block = 0;
+                    while k_in_block < actual_block_len {
+                        // Load one byte containing two 4-bit weights
+                        let packed_byte = *weights_ptr.add(k_in_block / 2);
+                        // Extract the two 4-bit values (little-endian nibble order: lower 4 bits first)
+                        let w0 = (packed_byte & 0x0F) as f32;
+                        let w1 = ((packed_byte >> 4) & 0x0F) as f32;
+
+                        // Dequantize: (weight - 8) * scale
+                        let dq0 = (w0 - 8.0) * scale;
+                        let dq1 = (w1 - 8.0) * scale;
+
+                        // Global column index
+                        let global_k0 = block_start + k_in_block;
+                        let global_k1 = block_start + k_in_block + 1;
+
+                        // Accumulate with input vector elements
+                        if global_k0 < k {
+                            acc += dq0 * b.get_2d(global_k0, j)?;
+                        }
+                        if global_k1 < k {
+                            acc += dq1 * b.get_2d(global_k1, j)?;
+                        }
+
+                        k_in_block += 2;
+                    }
+                }
+
+                // Store the accumulated result
+                c.set_2d(i, j, acc)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Quantized GEMV engine for Q4_0 format.
+/// Performs fused dequantization and matrix-vector multiplication.
+/// Assumes weight matrix is stored in Q4_0 format with block-wise scaling.
+impl Q4Engine {
+    /// Fused Q4_0 dequantization and GEMV: y = A * x, where A is Q4_0 packed.
+    ///
+    /// # Arguments
+    /// * `a` - Packed Q4_0 weight matrix (M x K)
+    /// * `x` - Input vector (f32) of length K.
+    /// * `y` - Output vector (f32) of length M (to be accumulated into).
+    /// * `a_scales` - Scale factors for A tensor, one per block
+    /// * `block_size` - Block size for quantization (typically 32 for Q4_0)
+    ///
+    /// # Safety
+    /// This function uses unsafe pointer arithmetic and assumes that the input pointers are valid
+    /// and the tensors are properly aligned and within bounds.
+    #[inline(always)]
+    pub unsafe fn gemv_q4_0_f32(
+        a: &TensorView,
+        x: &TensorView,
+        y: &mut TensorMut,
+        a_scales: &[f32],
+        block_size: usize, // typically 32 for Q4_0
+    ) -> Result<(), KernelError> {
+        // Validate tensor types
+        if a.tensor_type() != TensorType::Q4_0 {
+            return Err(KernelError::QuantizationNotSupported);
+        }
+        if x.tensor_type() != TensorType::F32 {
+            return Err(KernelError::QuantizationNotSupported);
+        }
+        if y.tensor_type() != TensorType::F32 {
+            return Err(KernelError::QuantizationNotSupported);
+        }
+
+        let shape_a = a.shape();
+        let shape_x = x.shape();
+        let shape_y = y.shape();
+
+        // Validate dimensions
+        if shape_a.len() != 2 || shape_x.len() != 1 || shape_y.len() != 1 {
+            return Err(KernelError::DimensionMismatch);
+        }
+
+        let m = shape_a[0]; // rows of A
+        let k = shape_a[1]; // cols of A, size of x
+        let x_len = shape_x[0]; // size of x
+        let y_len = shape_y[0]; // size of y
+
+        if k != x_len {
+            return Err(KernelError::DimensionMismatch);
+        }
+        if m != y_len {
+            return Err(KernelError::DimensionMismatch);
+        }
+
+        let num_blocks_per_row = (k + block_size - 1) / block_size;
+        let expected_scales_len = m * num_blocks_per_row;
+        if a_scales.len() != expected_scales_len {
+            return Err(KernelError::DimensionMismatch);
+        }
+
+        // Process each row of A
         for i in 0..m {
             let mut acc = 0.0f32;
-            let row_base = i * (num_blocks_per_row * (block_size / 2 + core::mem::size_of::<f32>()));
-            let scale_base = i * num_blocks_per_row;
 
-            for b in 0..num_blocks_per_row {
-                let block_start = b * block_size;
+            // Process each block in the row
+            for block_idx in 0..num_blocks_per_row {
+                let block_start = block_idx * block_size;
                 let block_end = core::cmp::min(block_start + block_size, k);
                 let actual_block_len = block_end - block_start;
 
                 // Pointer to the packed weights for this block in the row
-                let mut weights_ptr = a_packed.add(row_base + b * (block_size / 2));
+                let weights_ptr = a.data().as_ptr().add(
+                    i * (num_blocks_per_row * (block_size / 2)) +
+                    block_idx * (block_size / 2)
+                );
                 // Pointer to the scale for this block
-                let scale_ptr = scales.add(scale_base + b);
+                let scale_ptr = a_scales.as_ptr().add(i * num_blocks_per_row + block_idx);
                 let scale = *scale_ptr;
 
                 // Process the block in chunks of 2 elements (since each byte holds 2 weights)
-                let mut j = 0;
-                while j < actual_block_len {
+                let mut k_in_block = 0;
+                while k_in_block < actual_block_len {
                     // Load one byte containing two 4-bit weights
-                    let packed_byte = *weights_ptr.add(j / 2);
-                    // Extract the two 4-bit values (assuming little-endian nibble order: lower 4 bits first?)
-                    // In GGUF Q4_0, the packing is: two 4-bit values per byte, with the least significant 4 bits being the first weight.
+                    let packed_byte = *weights_ptr.add(k_in_block / 2);
+                    // Extract the two 4-bit values (little-endian nibble order: lower 4 bits first)
                     let w0 = (packed_byte & 0x0F) as f32;
                     let w1 = ((packed_byte >> 4) & 0x0F) as f32;
 
@@ -67,27 +216,34 @@ impl Q4Engine {
                     let dq0 = (w0 - 8.0) * scale;
                     let dq1 = (w1 - 8.0) * scale;
 
+                    // Global column index
+                    let global_k0 = block_start + k_in_block;
+                    let global_k1 = block_start + k_in_block + 1;
+
                     // Accumulate with input vector elements
-                    if j < actual_block_len {
-                        acc += dq0 * *x.add(block_start + j);
+                    if global_k0 < k {
+                        acc += dq0 * x.get(&[global_k0])?;
                     }
-                    if j + 1 < actual_block_len {
-                        acc += dq1 * *x.add(block_start + j + 1);
+                    if global_k1 < k {
+                        acc += dq1 * x.get(&[global_k1])?;
                     }
 
-                    j += 2;
-                    weights_ptr = weights_ptr.add(1); // move to next byte
+                    k_in_block += 2;
                 }
             }
 
-            *y.add(i) = acc;
+            // Store the accumulated result
+            *y.get_mut(&[i])? = acc;
         }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{alloc, Layout};
 
     #[test]
     fn test_q4_0_gemv_small() {
@@ -104,33 +260,70 @@ mod tests {
         let num_blocks_per_row = (k + block_size - 1) / block_size; // 1
 
         // Allocate space for packed weights: 1 byte per block (since block_size/2 = 1)
-        let mut packed = vec![0u8; num_blocks_per_row];
-        packed[0] = 0xA9; // 1010 1001
+        let packed_layout = Layout::from_size_align(num_blocks_per_row, 64).unwrap();
+        let packed_ptr = unsafe { alloc(packed_layout) as *mut u8 };
+        unsafe { *packed_ptr = 0xA9u8; } // 1010 1001
 
         // Scale for the block
-        let scale = 1.0f32;
-        let scales = vec![scale];
+        let scale_layout = Layout::from_size_align(core::mem::size_of::<f32>(), 64).unwrap();
+        let scale_ptr = unsafe { alloc(scale_layout) as *mut f32 };
+        unsafe { *scale_ptr = 1.0f32; }
 
-        // Input vector
-        let x = [3.0f32, 4.0f32];
+        // Input vector: [3.0, 4.0]
+        let x_layout = Layout::from_size_align(k * core::mem::size_of::<f32>(), 64).unwrap();
+        let x_ptr = unsafe { alloc(x_layout) as *mut f32 };
+        unsafe {
+            *x_ptr.add(0) = 3.0f32;
+            *x_ptr.add(1) = 4.0f32;
+        }
 
-        // Expected output: (1.0*3.0 + 2.0*4.0) = 3.0 + 8.0 = 11.0
-        let mut y = vec![0.0f32; m];
+        // Expected output vector: [11.0] (since 1.0*3.0 + 2.0*4.0 = 3.0 + 8.0 = 11.0)
+        let y_layout = Layout::from_size_align(m * core::mem::size_of::<f32>(), 64).unwrap();
+        let y_ptr = unsafe { alloc(y_layout) as *mut f32 };
+        unsafe { *y_ptr = 0.0f32; }
+
+        // Create tensors
+        let a = unsafe {
+            TensorView::from_raw_parts(
+                std::slice::from_raw_parts(packed_ptr, num_blocks_per_row),
+                &[m, k],
+                TensorType::Q4_0
+            ).unwrap()
+        };
+        let x = unsafe {
+            TensorView::from_raw_parts(
+                std::slice::from_raw_parts(x_ptr as *const u8, k * core::mem::size_of::<f32>()),
+                &[k],
+                TensorType::F32
+            ).unwrap()
+        };
+        let mut y = unsafe {
+            TensorMut::from_raw_parts(
+                std::slice::from_raw_parts_mut(y_ptr as *mut u8, m * core::mem::size_of::<f32>()),
+                &[m],
+                TensorType::F32
+            ).unwrap()
+        };
+
+        let scales = unsafe {
+            std::slice::from_raw_parts(scale_ptr, 1)
+        };
 
         // Safety: we are using raw pointers, but the data is valid for this test.
         unsafe {
-            Q4Engine::gemv_q4_0(
-                packed.as_ptr(),
-                scales.as_ptr(),
-                x.as_ptr(),
-                y.as_mut_ptr(),
-                m,
-                k,
-                block_size,
-            );
+            Q4Engine::gemv_q4_0_f32(&a, &x, &mut y, scales, block_size).unwrap();
         }
 
-        assert_eq!(y[0], 11.0);
+        let result = unsafe { *y_ptr };
+        assert_eq!(result, 11.0);
+
+        // Cleanup
+        unsafe {
+            std::alloc::dealloc(packed_ptr, packed_layout);
+            std::alloc::dealloc(scale_ptr as *mut u8, scale_layout);
+            std::alloc::dealloc(x_ptr as *mut u8, x_layout);
+            std::alloc::dealloc(y_ptr as *mut u8, y_layout);
+        }
     }
 
     #[test]
@@ -143,26 +336,157 @@ mod tests {
 
         // All weights zero -> quantized value 8 (since (0-8)*scale = 0 => weight=8)
         // Packed: two 8's per byte: 0x88 (1000_1000)
-        let mut packed = vec![0x88u8; num_blocks_per_row]; // 2 bytes
-
-        let scale = 1.0f32;
-        let scales = vec![scale; num_blocks_per_row];
-
-        let x = vec![0.0f32; k];
-        let mut y = vec![0.0f32; m];
-
+        let packed_layout = Layout::from_size_align(num_blocks_per_row, 64).unwrap();
+        let packed_ptr = unsafe { alloc(packed_layout) as *mut u8 };
         unsafe {
-            Q4Engine::gemv_q4_0(
-                packed.as_ptr(),
-                scales.as_ptr(),
-                x.as_ptr(),
-                y.as_mut_ptr(),
-                m,
-                k,
-                block_size,
-            );
+            *packed_ptr.add(0) = 0x88u8;
+            *packed_ptr.add(1) = 0x88u8;
         }
 
-        assert_eq!(y[0], 0.0);
+        let scale_layout = Layout::from_size_align(num_blocks_per_row * core::mem::size_of::<f32>(), 64).unwrap();
+        let scale_ptr = unsafe { alloc(scale_layout) as *mut f32 };
+        unsafe {
+            *scale_ptr.add(0) = 1.0f32;
+            *scale_ptr.add(1) = 1.0f32;
+        }
+
+        // Input vector: [0.0, 0.0, 0.0, 0.0]
+        let x_layout = Layout::from_size_align(k * core::mem::size_of::<f32>(), 64).unwrap();
+        let x_ptr = unsafe { alloc(x_layout) as *mut f32 };
+        unsafe {
+            *x_ptr.add(0) = 0.0f32;
+            *x_ptr.add(1) = 0.0f32;
+            *x_ptr.add(2) = 0.0f32;
+            *x_ptr.add(3) = 0.0f32;
+        }
+
+        // Expected output vector: [0.0]
+        let y_layout = Layout::from_size_align(m * core::mem::size_of::<f32>(), 64).unwrap();
+        let y_ptr = unsafe { alloc(y_layout) as *mut f32 };
+        unsafe { *y_ptr = 0.0f32; }
+
+        // Create tensors
+        let a = unsafe {
+            TensorView::from_raw_parts(
+                std::slice::from_raw_parts(packed_ptr, num_blocks_per_row),
+                &[m, k],
+                TensorType::Q4_0
+            ).unwrap()
+        };
+        let x = unsafe {
+            TensorView::from_raw_parts(
+                std::slice::from_raw_parts(x_ptr as *const u8, k * core::mem::size_of::<f32>()),
+                &[k],
+                TensorType::F32
+            ).unwrap()
+        };
+        let mut y = unsafe {
+            TensorMut::from_raw_parts(
+                std::slice::from_raw_parts_mut(y_ptr as *mut u8, m * core::mem::size_of::<f32>()),
+                &[m],
+                TensorType::F32
+            ).unwrap()
+        };
+
+        let scales = unsafe {
+            std::slice::from_raw_parts(scale_ptr, num_blocks_per_row)
+        };
+
+        unsafe {
+            Q4Engine::gemv_q4_0_f32(&a, &x, &mut y, scales, block_size).unwrap();
+        }
+
+        let result = unsafe { *y_ptr };
+        assert_eq!(result, 0.0);
+
+        // Cleanup
+        unsafe {
+            std::alloc::dealloc(packed_ptr, packed_layout);
+            std::alloc::dealloc(scale_ptr as *mut u8, scale_layout);
+            std::alloc::dealloc(x_ptr as *mut u8, x_layout);
+            std::alloc::dealloc(y_ptr as *mut u8, y_layout);
+        }
+    }
+
+    #[test]
+    fn test_q4_0_gemv_multi_row() {
+        let m = 2;
+        let k = 4;
+        let block_size = 32; // Standard Q4_0 block size
+        let num_blocks_per_row = (k + block_size - 1) / block_size; // 1
+
+        // Allocate space for packed weights: m * num_blocks_per_row * (block_size/2)
+        let packed_size = m * num_blocks_per_row * (block_size / 2);
+        let packed_layout = Layout::from_size_align(packed_size, 64).unwrap();
+        let packed_ptr = unsafe { alloc(packed_layout) as *mut u8 };
+        unsafe {
+            // Row 0: all weights 1.0 (quantized 9) -> 0x99
+            for i in 0..(block_size / 2) {
+                *packed_ptr.add(i) = 0x99u8;
+            }
+            // Row 1: all weights 2.0 (quantized 10) -> 0xAA
+            for i in 0..(block_size / 2) {
+                *packed_ptr.add(num_blocks_per_row * (block_size / 2) + i) = 0xAAu8;
+            }
+        }
+
+        let scale_size = m * num_blocks_per_row;
+        let scale_layout = Layout::from_size_align(scale_size * core::mem::size_of::<f32>(), 64).unwrap();
+        let scale_ptr = unsafe { alloc(scale_layout) as *mut f32 };
+        unsafe {
+            *scale_ptr.add(0) = 1.0f32; // Row 0 scale
+            *scale_ptr.add(1) = 1.0f32; // Row 1 scale
+        }
+
+        let x_layout = Layout::from_size_align(k * core::mem::size_of::<f32>(), 64).unwrap();
+        let x_ptr = unsafe { alloc(x_layout) as *mut f32 };
+        unsafe {
+            for i in 0..k { *x_ptr.add(i) = 1.0f32; }
+        }
+
+        let y_layout = Layout::from_size_align(m * core::mem::size_of::<f32>(), 64).unwrap();
+        let y_ptr = unsafe { alloc(y_layout) as *mut f32 };
+        unsafe {
+            *y_ptr.add(0) = 0.0f32;
+            *y_ptr.add(1) = 0.0f32;
+        }
+
+        let a = unsafe {
+            TensorView::from_raw_parts(
+                std::slice::from_raw_parts(packed_ptr, packed_size),
+                &[m, k],
+                TensorType::Q4_0
+            ).unwrap()
+        };
+        let x = unsafe {
+            TensorView::from_raw_parts(
+                std::slice::from_raw_parts(x_ptr as *const u8, k * core::mem::size_of::<f32>()),
+                &[k],
+                TensorType::F32
+            ).unwrap()
+        };
+        let mut y = unsafe {
+            TensorMut::from_raw_parts(
+                std::slice::from_raw_parts_mut(y_ptr as *mut u8, m * core::mem::size_of::<f32>()),
+                &[m],
+                TensorType::F32
+            ).unwrap()
+        };
+
+        let scales = unsafe { std::slice::from_raw_parts(scale_ptr, scale_size) };
+
+        unsafe {
+            Q4Engine::gemv_q4_0_f32(&a, &x, &mut y, scales, block_size).unwrap();
+        }
+
+        assert_eq!(unsafe { *y_ptr.add(0) }, 4.0); // 1.0 * 4 elements
+        assert_eq!(unsafe { *y_ptr.add(1) }, 8.0); // 2.0 * 4 elements
+
+        unsafe {
+            std::alloc::dealloc(packed_ptr, packed_layout);
+            std::alloc::dealloc(scale_ptr as *mut u8, scale_layout);
+            std::alloc::dealloc(x_ptr as *mut u8, x_layout);
+            std::alloc::dealloc(y_ptr as *mut u8, y_layout);
+        }
     }
 }
