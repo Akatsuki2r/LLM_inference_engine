@@ -45,7 +45,7 @@ impl TransformerModel {
         let embedding_size = hidden_size * seq_len * 4;
         let embedding_ptr = arena.alloc(embedding_size, MemoryCategory::Activations).map_err(|e| e.to_string())?;
         
-        let mut hidden_states_buf = unsafe { std::slice::from_raw_parts_mut(embedding_ptr, embedding_size) };
+        let hidden_states_buf = unsafe { std::slice::from_raw_parts_mut(embedding_ptr, embedding_size) };
         let mut hidden_states = TensorMut::from_raw_parts(hidden_states_buf, &[seq_len, hidden_size], TensorType::F32).map_err(|e| e.to_string())?;
         self.embedding.forward(prompt, &mut hidden_states).map_err(|e| format!("{:?}", e))?;
 

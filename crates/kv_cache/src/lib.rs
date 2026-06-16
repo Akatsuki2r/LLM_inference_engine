@@ -74,7 +74,7 @@ impl<'a> KVCache<'a> {
         assert!(arena_data.len() >= total_needed, "Insufficient arena memory for KVCache");
 
         let mut layers = Vec::with_capacity(num_layers);
-        let mut offset = 0;
+        let _offset = 0;
 
         // Split the provided arena data into segments for each layer
         let (mut all_keys, mut all_values) = arena_data.split_at_mut(num_layers * layer_size);

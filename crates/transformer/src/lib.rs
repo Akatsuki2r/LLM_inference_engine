@@ -16,7 +16,7 @@ impl Embedding {
     }
 
     pub fn forward(&self, token_ids: &[usize], output: &mut TensorMut) -> Result<(), KernelError> {
-        let seq_len = token_ids.len();
+        let _seq_len = token_ids.len();
         let output_data = unsafe {
             std::slice::from_raw_parts_mut(output.data_mut().as_mut_ptr() as *mut f32, output.data().len() / 4)
         };

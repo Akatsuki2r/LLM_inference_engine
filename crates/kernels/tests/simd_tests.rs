@@ -3,7 +3,7 @@ mod tests {
     use aether_arena::{UnifiedArena, MemoryCategory};
     use aether_tensor::{TensorView, TensorMut, TensorType};
     use aether_kernels::{NaiveEngine, simd::AvxEngine};
-    use std::vec;
+    
 
     #[test]
     fn test_simd_avx2_mathematical_parity() {
@@ -12,7 +12,7 @@ mod tests {
 
         // Allocate a single buffer for all allocations to avoid multiple mutable borrows
         let total_size = 32 + 256 + 32 + 32; // 352 bytes
-        let mut big_buf = arena.alloc_slice(total_size, MemoryCategory::Scratch).unwrap();
+        let big_buf = arena.alloc_slice(total_size, MemoryCategory::Scratch).unwrap();
 
         // Split the buffer into four parts: 32, 256, 32, 32
         let (buf_a, rest) = big_buf.split_at_mut(32);
