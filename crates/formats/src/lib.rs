@@ -20,7 +20,14 @@ pub enum GgufError {
     InvalidTensorType(u32),
     #[error("UTF-8 decoding error: {0}")]
     Utf8Error(#[from] std::string::FromUtf8Error),
+    #[error("Limit exceeded: {0}")]
+    LimitExceeded(&'static str),
 }
+
+const MAX_METADATA_COUNT: u64 = 2048;
+const MAX_TENSOR_COUNT: u64 = 10000;
+const MAX_DIMS: u32 = 12;
+const MAX_STRING_LEN: usize = 65536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufValueType {
@@ -73,7 +80,7 @@ impl TryFrom<u32> for GgufTensorType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GgufValue {
     Uint8(u8),
     Int8(i8),
@@ -96,8 +103,8 @@ pub struct GgufTensorInfo {
 
 pub struct GgufHeader {
     pub version: u32,
-    pub tensor_count: u32,
-    pub metadata_count: u32,
+    pub tensor_count: u64,
+    pub metadata_count: u64,
 }
 
 pub struct GgufModel {
@@ -122,8 +129,15 @@ pub fn parse(data: &[u8]) -> Result<GgufModel, GgufError> {
         return Err(GgufError::UnsupportedVersion(version));
     }
 
-    let tensor_count = cursor.read_u32::<LittleEndian>()?;
-    let metadata_count = cursor.read_u32::<LittleEndian>()?;
+    let tensor_count = cursor.read_u64::<LittleEndian>()?;
+    let metadata_count = cursor.read_u64::<LittleEndian>()?;
+
+    if tensor_count > MAX_TENSOR_COUNT {
+        return Err(GgufError::LimitExceeded("Too many tensors"));
+    }
+    if metadata_count > MAX_METADATA_COUNT {
+        return Err(GgufError::LimitExceeded("Too many metadata entries"));
+    }
 
     let mut metadata = HashMap::new();
     for _ in 0..metadata_count {
@@ -137,6 +151,9 @@ pub fn parse(data: &[u8]) -> Result<GgufModel, GgufError> {
     for _ in 0..tensor_count {
         let name = read_string(&mut cursor)?;
         let n_dims = cursor.read_u32::<LittleEndian>()?;
+        if n_dims > MAX_DIMS {
+            return Err(GgufError::LimitExceeded("Too many dimensions"));
+        }
         let mut dimensions = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
             dimensions.push(cursor.read_u64::<LittleEndian>()?);
@@ -173,6 +190,9 @@ pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<GgufModel, GgufError> {
 
 fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String, GgufError> {
     let len = cursor.read_u64::<LittleEndian>()? as usize;
+    if len > MAX_STRING_LEN {
+        return Err(GgufError::LimitExceeded("String too long"));
+    }
     let mut buf = vec![0u8; len];
     cursor.read_exact(&mut buf)?;
     Ok(String::from_utf8(buf)?)
@@ -202,8 +222,8 @@ mod tests {
         // Magic "GGUF", Version 3, Tensor Count 0, Metadata Count 0
         let mut data = b"GGUF".to_vec();
         data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
 
         let model = parse(&data).unwrap();
         assert_eq!(model.header.version, 3);
@@ -216,8 +236,8 @@ mod tests {
         // Magic "GGUF", Version 3, Tensor Count 0, Metadata Count 1
         let mut data = b"GGUF".to_vec();
         data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
 
         // Key: "test", type: Uint32, value: 42
         let key = "test";
@@ -240,9 +260,12 @@ mod tests {
     #[test]
     fn test_unsupported_version() {
         let mut data = b"GGUF".to_vec();
-        data.extend_from_slice(&2u32.to_le_bytes()); // Version 2
-        data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        // Change version to 2
+        data[4..8].copy_from_slice(&2u32.to_le_bytes());
 
         let result = parse(&data.as_slice());
         assert!(matches!(result, Err(GgufError::UnsupportedVersion(2))));
