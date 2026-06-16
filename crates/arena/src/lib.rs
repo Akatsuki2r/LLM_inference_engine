@@ -51,20 +51,27 @@ impl UnifiedArena {
     pub fn alloc(&mut self, size: usize, _category: MemoryCategory) -> Result<*mut u8, ArenaError> {
         // Calculate alignment padding to ensure the NEXT pointer is also 64-byte aligned
         let align = 64;
-        let current_ptr = unsafe { self.base_ptr.as_ptr().add(self.offset) };
-        let padding = (align - (current_ptr as usize % align)) % align;
+        let current_ptr = self.base_ptr.as_ptr() as usize;
+        let current_offset_ptr = current_ptr.checked_add(self.offset).ok_or(ArenaError::AllocationFailed)?;
+        
+        let padding = (align - (current_offset_ptr % align)) % align;
 
-        let total_needed = size + padding;
+        let total_needed = size.checked_add(padding).ok_or(ArenaError::AllocationFailed)?;
 
-        if self.offset + total_needed > self.capacity {
+        let next_offset = self.offset.checked_add(total_needed).ok_or(ArenaError::Overflow {
+            requested: total_needed,
+            available: self.capacity.saturating_sub(self.offset),
+        })?;
+
+        if next_offset > self.capacity {
             return Err(ArenaError::Overflow {
                 requested: total_needed,
-                available: self.capacity - self.offset,
+                available: self.capacity.saturating_sub(self.offset),
             });
         }
 
         let alloc_ptr = unsafe { self.base_ptr.as_ptr().add(self.offset + padding) };
-        self.offset += total_needed;
+        self.offset = next_offset;
 
         Ok(alloc_ptr)
     }
